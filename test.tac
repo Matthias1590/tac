@@ -19,7 +19,6 @@ func @get_byte() -> i8 {
 
 extern @printf;
 data @fmt = 37:u8, 100:u8, 10:u8, 0:u8;  // "%d\n\0"
-// data @fmt = 37:u8, 117:u8, 10:u8, 0:u8;  // "%u\n\0"
 
 func @main() -> i32 {
     call %1:i8, @get_byte;

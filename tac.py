@@ -357,22 +357,17 @@ def _(p):
     return VoidType()
 
 class IntType(Type):
-    def __init__(self, bits: int):
+    def __init__(self, bits: int, signed: bool):
         assert bits % 8 == 0, "Int type with non-byte-aligned size"
         super().__init__(bits // 8)
+        self.signed = signed
 
 @pg.production("type : INT_TYPE")
 def _(p):
-    return IntType(int(p[0].getstr()[1:]))
+    return IntType(int(p[0].getstr()[1:]), True)
 
-class UIntType(Type):
-    def __init__(self, bits: int):
-        assert bits % 8 == 0, "UInt type with non-byte-aligned size"
-        super().__init__(bits // 8)
-
-@pg.production("type : UINT_TYPE")
 def _(p):
-    return UIntType(int(p[0].getstr()[1:]))
+    return IntType(int(p[0].getstr()[1:]), False)
 
 class Statement(DebugPrint):
     def to_x64(self, x64: X64FuncDecl) -> None:
@@ -404,19 +399,6 @@ def _(p):
 class Expression(DebugPrint):
     def to_x64(self, x64: X64FuncDecl) -> X64Value:
         raise NotImplementedError(self.__class__.__name__, "to_x64")
-
-class Discard(Statement):
-    def __init__(self, expr: Expression):
-        self.expr = expr
-
-    def to_x64(self, x64: X64FuncDecl) -> None:
-        # TODO: Dont call expr.to_x64 if we know for sure it doesn't have side effects
-        x64.emit_comment("Discard statement")
-        self.expr.to_x64(x64)
-
-@pg.production("statement : op SEMICOLON")
-def _(p):
-    return Discard(p[0])
 
 class If(Statement):
     def __init__(self, condition: Expression, block: Block):
@@ -451,12 +433,19 @@ class Assign(Statement):
         x64.emit_comment("Assign statement")
         x64.emit_mov(self.ref.to_x64(x64), self.expr.to_x64(x64))
 
-@pg.production("statement : local_ref EQ op SEMICOLON")
-@pg.production("statement : temp_ref EQ op SEMICOLON")
-@pg.production("statement : local_ref EQ expression SEMICOLON")
-@pg.production("statement : temp_ref EQ expression SEMICOLON")
+# @pg.production("statement : local_ref EQ op SEMICOLON")
+# @pg.production("statement : temp_ref EQ op SEMICOLON")
+# @pg.production("statement : local_ref EQ expression SEMICOLON")
+# @pg.production("statement : temp_ref EQ expression SEMICOLON")
+# def _(p):
+#     return Assign(p[0], p[2])
+
+@pg.production("ref : local_ref")
+@pg.production("ref : temp_ref")
+@pg.production("ref : param_ref")
+@pg.production("ref : func_ref")
 def _(p):
-    return Assign(p[0], p[2])
+    return p[0]
 
 class LocalRef(Ref):
     pass
@@ -483,7 +472,7 @@ def _(p):
 
 class FuncRef(Ref):
     def __init__(self, name: str) -> None:
-        super().__init__(name, IntType(64))
+        super().__init__(name, IntType(64, False))
 
     def to_x64(self, x64: X64FuncDecl) -> X64Value:
         return X64Label(self.name)
@@ -492,106 +481,134 @@ class FuncRef(Ref):
 def _(p):
     return FuncRef(p[0].getstr()[1:])
 
-class Op(Expression):
+class Op(Statement):
     pass
 
 class EqOp(Op):
-    def __init__(self, left: Expression, right: Expression):
+    def __init__(self, dest: Ref, left: Expression, right: Expression):
+        self.dest = dest
         self.left = left
         self.right = right
 
-    def to_x64(self, x64: X64FuncDecl) -> X64Value:
-        res = x64.stack_alloc(1)
-        if_true = x64.temp_label()
-        x64.emit_cmp(self.left.to_x64(x64), self.right.to_x64(x64))
-        x64.emit_mov(res, X64Int(1, 1))
-        x64.emit_je(if_true)
-        x64.emit_mov(res, X64Int(0, 1))
-        x64.emit_label(if_true)
-        return res
+    def to_x64(self, x64: X64FuncDecl) -> None:
+        # res = x64.stack_alloc(1)
+        # if_true = x64.temp_label()
+        # x64.emit_cmp(self.left.to_x64(x64), self.right.to_x64(x64))
+        # x64.emit_mov(res, X64Int(1, 1))
+        # x64.emit_je(if_true)
+        # x64.emit_mov(res, X64Int(0, 1))
+        # x64.emit_label(if_true)
+        # return res
+        if not type(self.dest.type) == IntType:
+            raise Exception("Destination type must be int")
+        if self.dest.type.bytes != 1:
+            raise Exception("Destination type must be 1 byte")
+        # TODO: Why do we not have access to the expression type??? We need it for type checking
+        # if self.left.type != self.right.type:
+        #    ...
 
-@pg.production("op : OP_EQ expression COMMA expression")
+        x64_dest = self.dest.to_x64(x64)
+        x64_left = self.left.to_x64(x64)
+        x64_right = self.right.to_x64(x64)
+
+        # TODO: Use setcc instead of jcc + mov
+        if_true = x64.temp_label()
+        x64.emit_cmp(x64_left, x64_right)
+        x64.emit_mov(x64_dest, X64Int(1, 1))
+        x64.emit_je(if_true)
+        x64.emit_mov(x64_dest, X64Int(0, 1))
+        x64.emit_label(if_true)
+
+@pg.production("op : OP_EQ ref COMMA expression COMMA expression")
 def _(p):
-    return EqOp(p[1], p[3])
+    return EqOp(p[1], p[3], p[5])
 
 class ExtOp(Op):
-    def __init__(self, to_type: Type, expr: Expression):
-        self.to_type = to_type
+    def __init__(self, dest: Ref, expr: Expression):
+        self.dest = dest
         self.expr = expr
 
-    def to_x64(self, x64: X64FuncDecl) -> X64Value:
+    def to_x64(self, x64: X64FuncDecl) -> None:
+        # TODO: Ensure destination has the same signedness as expr
         expr_val = self.expr.to_x64(x64)
-        res = x64.stack_alloc(self.to_type.bytes)
-        if isinstance(self.to_type, IntType):
+        res = self.dest.to_x64(x64)
+        if not isinstance(self.dest.type, IntType):
+            raise Exception("Destination type must be int")
+        
+        if self.dest.type.signed:
             x64.emit_movsx(res, expr_val)
-        elif isinstance(self.to_type, UIntType):
-            x64.emit_movzx(res, expr_val)
-        elif isinstance(self.to_type, VoidType):
-            raise Exception("Cannot extend to void type")
         else:
-            raise NotImplementedError("ExtOp for non-int types not implemented yet")
-        return res
+            x64.emit_movzx(res, expr_val)
 
-@pg.production("op : OP_EXT type COMMA expression")
+@pg.production("op : OP_EXT ref COMMA expression")
 def _(p):
     return ExtOp(p[1], p[3])
 
 class CastOp(Op):
-    def __init__(self, to_type: Type, expr: Expression):
-        self.to_type = to_type
+    def __init__(self, dest: Ref, expr: Expression):
+        self.dest = dest
         self.expr = expr
 
-    def to_x64(self, x64: X64FuncDecl) -> X64Value:
-        return self.expr.to_x64(x64)
+    def to_x64(self, x64: X64FuncDecl) -> None:
+        # return self.expr.to_x64(x64)
+        return super().to_x64(x64)
 
-@pg.production("op : OP_CAST type COMMA expression")
+@pg.production("op : OP_CAST ref COMMA expression")
 def _(p):
     return CastOp(p[1], p[3])
 
 class SubOp(Op):
-    def __init__(self, left: Expression, right: Expression):
+    def __init__(self, dest: Ref, left: Expression, right: Expression):
+        self.dest = dest
         self.left = left
         self.right = right
 
-    def to_x64(self, x64: X64FuncDecl) -> X64Value:
-        left_val = self.left.to_x64(x64)
-        right_val = self.right.to_x64(x64)
-        res = x64.stack_alloc(left_val.bytes)
-        x64.emit_mov(res, left_val)
-        x64.emit_sub(res, right_val)
-        return res
+    def to_x64(self, x64: X64FuncDecl) -> None:
+        # TODO: Type check operands
 
-@pg.production("op : OP_SUB expression COMMA expression")
+        if not type(self.dest.type) == IntType:
+            raise NotImplementedError("Non-int subtraction not implemented yet")
+
+        x64_dest = self.dest.to_x64(x64)
+        x64_left = self.left.to_x64(x64)
+        x64_right = self.right.to_x64(x64)
+
+        x64.emit_mov(x64_dest, x64_left)
+        x64.emit_sub(x64_dest, x64_right)
+
+@pg.production("op : OP_SUB ref COMMA expression COMMA expression")
 def _(p):
-    return SubOp(p[1], p[3])
+    return SubOp(p[1], p[3], p[5])
 
 class CallOp(Op):
-    def __init__(self, ret_type: Type, func: Expression, args: list[Expression]):
-        self.ret_type = ret_type
+    def __init__(self, dest: Ref, func: Expression, args: list[Expression]):
+        self.dest = dest
         self.func = func
         self.args = args
 
-    def to_x64(self, x64: X64FuncDecl) -> X64Value:
+    def to_x64(self, x64: X64FuncDecl) -> None:
         x64.emit_comment("Call")
         if len(self.args) > 6:
             raise NotImplementedError("Passing more than 6 parameters not implemented yet")
 
         for i, arg in enumerate(self.args):
-            val = arg.to_x64(x64)
-            x64.emit_mov(X64.PARAM_REGS[i].sized(val.bytes), val)
+            x64_arg = arg.to_x64(x64)
+            x64.emit_mov(X64.PARAM_REGS[i].sized(x64_arg.bytes), x64_arg)
 
         # TODO: Handle this better. It's for variadic functions where rax needs to be set to the number of floating point args
         x64.emit_mov(X64.RAX.sized(8), X64Int(0, 8))
 
         x64.emit_call(self.func.to_x64(x64))
 
-        if isinstance(self.ret_type, VoidType):
-            return None
-        # TODO: Decide which reg to use based on ret type, if its a float, we shouldnt use rax
-        return X64.RET_REG.sized(self.ret_type.bytes)
+        # TODO: Implement a void literal that lets you explicitly discard results of operations
+        # if isinstance(self.dest.type, VoidType):
+        #     return
 
-@pg.production("op : OP_CALL type COMMA expression COMMA args")
-@pg.production("op : OP_CALL type COMMA expression")
+        # TODO: Decide which reg to use based on ret type, if its a float, we shouldnt use rax
+        x64.emit_mov(self.dest.to_x64(x64), X64.RET_REG.sized(self.dest.type.bytes))
+
+@pg.production("op : OP_CALL ref COMMA expression COMMA args")
+@pg.production("op : OP_CALL ref COMMA expression")
 def _(p):
     if len(p) == 6:
         return CallOp(p[1], p[3], p[5])
@@ -610,21 +627,21 @@ def _(p):
         return [p[0]] + p[2]
 
 class AddOp(Op):
-    def __init__(self, left: Expression, right: Expression):
+    def __init__(self, dest: Ref, left: Expression, right: Expression):
+        self.dest = dest
         self.left = left
         self.right = right
 
-    def to_x64(self, x64: X64FuncDecl) -> X64Value:
+    def to_x64(self, x64: X64FuncDecl) -> None:
+        x64_dest = self.dest.to_x64(x64)
         left_val = self.left.to_x64(x64)
         right_val = self.right.to_x64(x64)
-        res = x64.stack_alloc(left_val.bytes)
-        x64.emit_mov(res, left_val)
-        x64.emit_add(res, right_val)
-        return res
+        x64.emit_mov(x64_dest, left_val)
+        x64.emit_add(x64_dest, right_val)
 
-@pg.production("op : OP_ADD expression COMMA expression")
+@pg.production("op : OP_ADD ref COMMA expression COMMA expression")
 def _(p):
-    return AddOp(p[1], p[3])
+    return AddOp(p[1], p[3], p[5])
 
 class RetOp(Statement):
     def __init__(self, expr: Expression | None):
@@ -645,18 +662,19 @@ class RetOp(Statement):
             x64.emit_mov(x64.ret_reg, self.expr.to_x64(x64))
         x64.emit_jmp(X64Label(".return"))
 
-@pg.production("statement : OP_RET expression SEMICOLON")
-@pg.production("statement : OP_RET SEMICOLON")
+@pg.production("op : OP_RET expression")
+@pg.production("op : OP_RET")
 def _(p):
     if len(p) == 2:
-        return RetOp(None)
-    else:
         return RetOp(p[1])
+    else:
+        return RetOp(None)
 
-@pg.production("expression : local_ref")
-@pg.production("expression : temp_ref")
-@pg.production("expression : param_ref")
-@pg.production("expression : func_ref")
+@pg.production("statement : op SEMICOLON")
+def _(p):
+    return p[0]
+
+@pg.production("expression : ref")
 @pg.production("expression : int")
 def _(p):
     return p[0]

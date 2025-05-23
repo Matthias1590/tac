@@ -701,7 +701,7 @@ def _(p):
 
 parser = pg.build()
 
-with open("test2.tac", "r") as f:
+with open("test.tac", "r") as f:
     source = f.read()
 
 funcs = parser.parse(lexer.lex(source))

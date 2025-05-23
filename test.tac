@@ -1,4 +1,6 @@
 func @mult($a:i32, $b:i32) -> i32 {
+    add %10:i32, $a:i32, $b:i32;
+
     eq %1:i8, $b:i32, 0:i32;
     if %1:i8 {
         // base case, a * 0 = 0

@@ -1,0 +1,3 @@
+- Add a command line interface instead of hardcoding paths and parameters
+- Add support for other architectures
+- Add a static analysis pass to do type checking and such

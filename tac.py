@@ -366,6 +366,7 @@ class IntType(Type):
 def _(p):
     return IntType(int(p[0].getstr()[1:]), True)
 
+@pg.production("type : UINT_TYPE")
 def _(p):
     return IntType(int(p[0].getstr()[1:]), False)
 

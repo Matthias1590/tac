@@ -1,5 +1,3 @@
-# TODO: Static analysis pass, checks types, resolves symbols, ensures int limits, etc.
-
 from __future__ import annotations
 import argparse
 import subprocess
@@ -53,7 +51,16 @@ lexer = lg.build()
 
 pg = rply.ParserGenerator(TOKENS.keys())
 
-class Top(DebugPrint):
+class Node(DebugPrint):
+    ctx: Ctx
+
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        raise NotImplementedError(self.__class__.__name__, "define_and_set_ctx")
+
+    def check(self) -> None:
+        raise NotImplementedError(self.__class__.__name__, "check")
+
+class Top(Node):
     def to_x64(self, x64: X64) -> X64Top:
         raise NotImplementedError(self.__class__.__name__, "to_x64")
 
@@ -85,6 +92,15 @@ class ExternDecl(Top):
     def __init__(self, name: str):
         self.name = name
 
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        # TODO: Add types to externs to indicate whether theyre a function (use ptr type), or a variable (use the var type)
+        ctx.define_global(self.name, IntType(64, False))
+
+    def check(self) -> None:
+        pass
+
     def to_x64(self, x64: X64) -> X64Top:
         return X64ExternDecl(x64, self.name)
 
@@ -105,6 +121,16 @@ class DataDecl(Top):
     def __init__(self, name: str, values: list[Int]):
         self.name = name
         self.values = values
+
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        # TODO: Use pointer type
+        self.ctx.define_global(self.name, IntType(64, False))
+
+    def check(self) -> None:
+        for value in self.values:
+            value.check()
 
     def to_x64(self, x64: X64) -> X64Top:
         return X64DataDecl(x64, self.name, self.values)
@@ -155,6 +181,21 @@ class FuncDecl(Top):
         self.ret_type = ret_type
         self.body = body
 
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        # TODO: Introduce a pointer type thats the size of the target architectures pointer size. Use that here
+        self.ctx.define_global(self.name, IntType(64, False))
+
+    def check(self) -> None:
+        child_ctx = self.ctx.create_child()
+
+        for param in self.params:
+            param.define_and_set_ctx(child_ctx)
+        self.body.define_and_set_ctx(child_ctx)
+
+        self.body.check()
+
     def to_x64(self, x64: X64) -> X64Top:
         if len(self.params) > len(X64.PARAM_REGS):
             raise NotImplementedError("Passing more than 6 parameters not implemented yet")
@@ -199,7 +240,7 @@ class X64FuncDecl(X64Top):
 
     def get_or_alloc_temp(self, name: str, type: Type) -> X64Value:
         if name in self.__temps:
-            assert self.__temps[name][1] == type, f"Type mismatch for temp {name}: {self.__temps[name][1]} != {type}"
+            assert self.__temps[name][1] == type, f"Type mismatch for temp {name}: {self.__temps[name][1]} != {type}, should be prevented by type checking"
             return self.__temps[name][0]
 
         val = self.stack_alloc(type.bytes)
@@ -321,10 +362,15 @@ class X64FuncDecl(X64Top):
 def _(p):
     return FuncDecl(p[1].getstr()[1:], p[3], p[6], p[7])
 
-class Param(DebugPrint):
+class Param(Node):
     def __init__(self, name: str, type: Type):
         self.name = name
         self.type = type
+
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        self.ctx.define_param(self.name, self.type)
 
 @pg.production("params : param COMMA params")
 @pg.production("params : param")
@@ -341,7 +387,7 @@ def _(p):
 def _(p):
     return Param(p[0].getstr()[1:], p[2])
 
-class Type(DebugPrint):
+class Type:
     def __init__(self, bytes: int) -> None:
         self.bytes = bytes
 
@@ -349,6 +395,9 @@ class Type(DebugPrint):
         if type(value) != type(self):
             return False
         return self.bytes == value.bytes
+
+    def __repr__(self) -> str:
+        raise NotImplementedError(self.__class__.__name__, "__repr__")
 
 class VoidType(Type):
     def __init__(self):
@@ -364,6 +413,9 @@ class IntType(Type):
         super().__init__(bits // 8)
         self.signed = signed
 
+    def __repr__(self) -> str:
+        return f"{'i' if self.signed else 'u'}{self.bytes * 8}"
+
 @pg.production("type : INT_TYPE")
 def _(p):
     return IntType(int(p[0].getstr()[1:]), True)
@@ -372,13 +424,24 @@ def _(p):
 def _(p):
     return IntType(int(p[0].getstr()[1:]), False)
 
-class Statement(DebugPrint):
+class Statement(Node):
     def to_x64(self, x64: X64FuncDecl) -> None:
         raise NotImplementedError(self.__class__.__name__, "to_x64")
 
 class Block(Statement):
     def __init__(self, statements: list[Statement]):
         self.statements = statements
+
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        child_ctx = ctx.create_child()
+        for statement in self.statements:
+            statement.define_and_set_ctx(child_ctx)
+
+    def check(self) -> None:
+        for statement in self.statements:
+            statement.check()
 
     def to_x64(self, x64: X64FuncDecl) -> None:
         for statement in self.statements:
@@ -399,7 +462,10 @@ def _(p):
     else:
         return [p[0]] + p[1]
 
-class Expression(DebugPrint):
+class Expression(Node):
+    def __init__(self, type: Type) -> None:
+        self.type = type
+
     def to_x64(self, x64: X64FuncDecl) -> X64Value:
         raise NotImplementedError(self.__class__.__name__, "to_x64")
 
@@ -407,6 +473,21 @@ class If(Statement):
     def __init__(self, condition: Expression, block: Block):
         self.condition = condition
         self.block = block
+
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        self.condition.define_and_set_ctx(ctx)
+        self.block.define_and_set_ctx(ctx)
+
+    def check(self) -> None:
+        self.condition.check()
+        if not isinstance(self.condition.type, IntType):
+            raise Exception(f"Condition must be an int type, got {self.condition.type}")
+        if self.condition.type.bytes != 1:
+            raise Exception(f"Condition must be 1 byte, got {self.condition.type.bytes} bytes")  # TODO: Maybe we should allow any size?
+
+        self.block.check()
 
     def to_x64(self, x64: X64FuncDecl) -> None:
         x64.emit_comment("If statement")
@@ -424,8 +505,8 @@ def _(p):
 
 class Ref(Expression):
     def __init__(self, name: str, type: Type) -> None:
+        super().__init__(type)
         self.name = name
-        self.type = type
 
 class Assign(Statement):
     def __init__(self, ref: Ref, expr: Expression):
@@ -458,6 +539,14 @@ def _(p):
     return LocalRef(p[0].getstr()[1:], p[2])
 
 class TempRef(Ref):
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        self.ctx.ensure_temp_exists(self.name, self.type)
+
+    def check(self) -> None:
+        pass
+
     def to_x64(self, x64: X64FuncDecl) -> X64Value:
         return x64.get_or_alloc_temp(self.name, self.type)
 
@@ -466,6 +555,14 @@ def _(p):
     return TempRef(p[0].getstr()[1:], p[2])
 
 class ParamRef(Ref):
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        self.ctx.ensure_param_exists(self.name, self.type)
+
+    def check(self) -> None:
+        pass
+
     def to_x64(self, x64: X64FuncDecl) -> X64Value:
         return x64.get_param(self.name, self.type)
 
@@ -476,6 +573,14 @@ def _(p):
 class FuncRef(Ref):
     def __init__(self, name: str) -> None:
         super().__init__(name, IntType(64, False))
+
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        ctx.ensure_global_exists(self.name, IntType(64, False))  # TODO: Use pointer type
+
+    def check(self) -> None:
+        pass
 
     def to_x64(self, x64: X64FuncDecl) -> X64Value:
         return X64Label(self.name)
@@ -493,23 +598,29 @@ class EqOp(Op):
         self.left = left
         self.right = right
 
-    def to_x64(self, x64: X64FuncDecl) -> None:
-        # res = x64.stack_alloc(1)
-        # if_true = x64.temp_label()
-        # x64.emit_cmp(self.left.to_x64(x64), self.right.to_x64(x64))
-        # x64.emit_mov(res, X64Int(1, 1))
-        # x64.emit_je(if_true)
-        # x64.emit_mov(res, X64Int(0, 1))
-        # x64.emit_label(if_true)
-        # return res
-        if not type(self.dest.type) == IntType:
-            raise Exception("Destination type must be int")
-        if self.dest.type.bytes != 1:
-            raise Exception("Destination type must be 1 byte")
-        # TODO: Why do we not have access to the expression type??? We need it for type checking
-        # if self.left.type != self.right.type:
-        #    ...
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
 
+        self.dest.define_and_set_ctx(ctx)
+        self.left.define_and_set_ctx(ctx)
+        self.right.define_and_set_ctx(ctx)
+
+    def check(self) -> None:
+        self.dest.check()
+        self.left.check()
+        self.right.check()
+
+        if not isinstance(self.dest.type, IntType):
+            raise Exception(f"Destination type must be int, got {self.dest.type}")
+        if self.dest.type.bytes != 1:
+            raise Exception(f"Destination type must be 1 byte, got {self.dest.type.bytes} bytes")
+
+        if self.left.type != self.right.type:
+            raise Exception(f"Type mismatch in equality operation, left: {self.left.type}, right: {self.right.type}")
+        if not isinstance(self.left.type, IntType):
+            raise NotImplementedError("Non-int equality not implemented yet")
+
+    def to_x64(self, x64: X64FuncDecl) -> None:
         x64_dest = self.dest.to_x64(x64)
         x64_left = self.left.to_x64(x64)
         x64_right = self.right.to_x64(x64)
@@ -530,6 +641,24 @@ class ExtOp(Op):
     def __init__(self, dest: Ref, expr: Expression):
         self.dest = dest
         self.expr = expr
+    
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        self.dest.define_and_set_ctx(ctx)
+        self.expr.define_and_set_ctx(ctx)
+
+    def check(self) -> None:
+        self.dest.check()
+        self.expr.check()
+
+        if not isinstance(self.dest.type, IntType):
+            raise NotImplementedError("Non-int extension not implemented yet")
+        if not isinstance(self.expr.type, IntType):
+            raise NotImplementedError("Non-int extension not implemented yet")
+        
+        if self.dest.type.bytes < self.expr.type.bytes:
+            raise Exception(f"Destination type {self.dest.type} must be larger than or equal to expression type {self.expr.type}")
 
     def to_x64(self, x64: X64FuncDecl) -> None:
         # TODO: Ensure destination has the same signedness as expr
@@ -566,6 +695,24 @@ class SubOp(Op):
         self.left = left
         self.right = right
 
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        self.dest.define_and_set_ctx(ctx)
+        self.left.define_and_set_ctx(ctx)
+        self.right.define_and_set_ctx(ctx)
+
+    def check(self) -> None:
+        self.dest.check()
+        self.left.check()
+        self.right.check()
+
+        if self.dest.type != self.left.type or self.dest.type != self.right.type:
+            raise Exception(f"Type mismatch in subtraction operation, all operands have to be the same type")
+        
+        if not isinstance(self.dest.type, IntType):
+            raise NotImplementedError("Non-int subtraction not implemented yet")
+
     def to_x64(self, x64: X64FuncDecl) -> None:
         # TODO: Type check operands
 
@@ -589,11 +736,26 @@ class CallOp(Op):
         self.func = func
         self.args = args
 
-    def to_x64(self, x64: X64FuncDecl) -> None:
-        x64.emit_comment("Call")
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        self.dest.define_and_set_ctx(ctx)
+        self.func.define_and_set_ctx(ctx)
+
+        for arg in self.args:
+            arg.define_and_set_ctx(ctx)
+
+    def check(self) -> None:
+        self.dest.check()
+        self.func.check()
+        for arg in self.args:
+            arg.check()
+
         if len(self.args) > 6:
             raise NotImplementedError("Passing more than 6 parameters not implemented yet")
 
+    def to_x64(self, x64: X64FuncDecl) -> None:
+        x64.emit_comment("Call")
         for i, arg in enumerate(self.args):
             x64_arg = arg.to_x64(x64)
             x64.emit_mov(X64.PARAM_REGS[i].sized(x64_arg.bytes), x64_arg)
@@ -635,12 +797,31 @@ class AddOp(Op):
         self.left = left
         self.right = right
 
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        self.dest.define_and_set_ctx(ctx)
+        self.left.define_and_set_ctx(ctx)
+        self.right.define_and_set_ctx(ctx)
+
+    def check(self) -> None:
+        self.dest.check()
+        self.left.check()
+        self.right.check()
+
+        if self.dest.type != self.left.type or self.dest.type != self.right.type:
+            raise Exception(f"Type mismatch in add operation, all operands have to be the same type")
+        
+        if not isinstance(self.dest.type, IntType):
+            raise NotImplementedError("Non-int addition not implemented yet")
+
     def to_x64(self, x64: X64FuncDecl) -> None:
         x64_dest = self.dest.to_x64(x64)
-        left_val = self.left.to_x64(x64)
-        right_val = self.right.to_x64(x64)
-        x64.emit_mov(x64_dest, left_val)
-        x64.emit_add(x64_dest, right_val)
+        x64_left = self.left.to_x64(x64)
+        x64_right = self.right.to_x64(x64)
+
+        x64.emit_mov(x64_dest, x64_left)
+        x64.emit_add(x64_dest, x64_right)
 
 @pg.production("op : OP_ADD ref COMMA expression COMMA expression")
 def _(p):
@@ -649,6 +830,17 @@ def _(p):
 class RetOp(Statement):
     def __init__(self, expr: Expression | None):
         self.expr = expr
+
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+        if self.expr is not None:
+            self.expr.define_and_set_ctx(ctx)
+
+    def check(self) -> None:
+        # TODO: Check that the return type matches the function's return type instead of doing that in the x64 pass
+        if self.expr is not None:
+            self.expr.check()
 
     def to_x64(self, x64: X64FuncDecl) -> None:
         x64.emit_comment("Return statement")
@@ -684,11 +876,22 @@ def _(p):
 
 class Int(Expression):
     def __init__(self, value: int, bits: int, signed: bool):
+        super().__init__(IntType(bits, signed))
+
         assert bits % 8 == 0, "Int type with non-byte-aligned size"
 
         self.value = value
         self.bytes = bits // 8
         self.signed = signed
+
+    def define_and_set_ctx(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+
+    def check(self) -> None:
+        try:
+            self.value.to_bytes(self.bytes, "little", signed=self.signed)
+        except OverflowError:
+            raise Exception(f"Value {self.value} does not fit in {self.bytes} byte(s)")
 
     def to_x64(self, x64: X64FuncDecl) -> X64Value:
         return X64Int(self.value, self.bytes)
@@ -702,6 +905,71 @@ def _(p):
     return Int(int(p[0].getstr()), int(p[2].getstr()[1:]), signed=False)
 
 parser = pg.build()
+
+class Ctx:
+    class Storage:
+        TEMP = "Temp"
+        PARAM = "Param"
+        LOCAL = "Local"
+        GLOBAL = "Global"
+
+    def __init__(self, parent: Ctx | None = None) -> None:
+        self.__parent = parent
+        self.__symbols: dict[tuple[str, str], Type] = {}
+
+    def create_child(self) -> Ctx:
+        return Ctx(self)
+
+    def __define_symbol(self, storage: str, name: str, type: Type) -> None:
+        if (storage, name) in self.__symbols:
+            raise Exception(f"{storage} {name!r} already defined")
+        self.__symbols[(storage, name)] = type
+
+    def define_global(self, name: str, type: Type) -> None:
+        assert self.__parent is None, "Global symbols should only be defined in the root context"
+
+        self.__define_symbol(Ctx.Storage.GLOBAL, name, type)
+
+    def define_param(self, name: str, type: Type) -> None:
+        self.__define_symbol(Ctx.Storage.PARAM, name, type)
+
+    def define_temp(self, name: str, type: Type) -> None:
+        self.__define_symbol(Ctx.Storage.TEMP, name, type)
+
+    def define_local(self, name: str, type: Type) -> None:
+        self.__define_symbol(Ctx.Storage.LOCAL, name, type)
+
+    def __try_get_symbol(self, storage: str, name: str) -> Type | None:
+        if (storage, name) in self.__symbols:
+            return self.__symbols[(storage, name)]
+
+        if self.__parent is not None:
+            return self.__parent.__try_get_symbol(storage, name)
+
+        return None
+
+    def __ensure_symbol_exists(self, storage: str, name: str, type: Type) -> None:
+        existing = self.__try_get_symbol(storage, name)
+        if existing is not None:
+            if existing != type:
+                raise Exception(f"{storage} {name!r} already defined with type {existing!r}, cannot redefine as {type!r}")
+            return
+
+        self.__define_symbol(storage, name, type)
+
+    def ensure_temp_exists(self, name: str, type: Type) -> None:
+        self.__ensure_symbol_exists(Ctx.Storage.TEMP, name, type)
+
+    def ensure_param_exists(self, name: str, type: Type) -> None:
+        self.__ensure_symbol_exists(Ctx.Storage.PARAM, name, type)
+
+    def ensure_global_exists(self, name: str, type: Type) -> None:
+        existing = self.__try_get_symbol(Ctx.Storage.GLOBAL, name)
+        if existing is None:
+            raise Exception(f"Global {name!r} not defined")
+
+        if existing != type:
+            raise Exception(f"Global {name!r} already defined with type {existing}, cannot redefine as {type}")
 
 def x64_ptr_size(bytes: int) -> str:
     if bytes == 8:
@@ -962,8 +1230,16 @@ except FileNotFoundError:
     print(f"Error: Input file {args.input} not found")
     exit(1)
 
-funcs = parser.parse(lexer.lex(source))
-assert isinstance(funcs, list)
+tops = parser.parse(lexer.lex(source))
+assert isinstance(tops, list)
+
+ctx = Ctx()
+for top in tops:
+    assert isinstance(top, Top)
+    top.define_and_set_ctx(ctx)
+for top in tops:
+    assert isinstance(top, Top)
+    top.check()
 
 for target in TARGETS:
     if target.name == args.target:
@@ -972,6 +1248,6 @@ else:
     print(f"Error: Target {args.target} not found")
     exit(1)
 
-if not target.run(funcs, args.output or get_with_ext(args.input, None)):
+if not target.run(tops, args.output or get_with_ext(args.input, None)):
     print(f"Error: Compilation failed")
     exit(1)

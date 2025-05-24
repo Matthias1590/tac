@@ -1,3 +1,2 @@
 - Add optimization passes
 - Add support for other architectures
-- Add a static analysis pass to do type checking and such

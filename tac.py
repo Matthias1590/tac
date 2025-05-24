@@ -1,9 +1,11 @@
 # TODO: Static analysis pass, checks types, resolves symbols, ensures int limits, etc.
-# TODO: Think about this: Do we care about number of parameters in external functions? Not like we can check anyway since we dont have function types
 
 from __future__ import annotations
+import argparse
+import subprocess
 import rply
 import io
+import os
 
 class DebugPrint:
     def __repr__(self) -> str:
@@ -535,7 +537,7 @@ class ExtOp(Op):
         res = self.dest.to_x64(x64)
         if not isinstance(self.dest.type, IntType):
             raise Exception("Destination type must be int")
-        
+
         if self.dest.type.signed:
             x64.emit_movsx(res, expr_val)
         else:
@@ -700,12 +702,6 @@ def _(p):
     return Int(int(p[0].getstr()), int(p[2].getstr()[1:]), signed=False)
 
 parser = pg.build()
-
-with open("test.tac", "r") as f:
-    source = f.read()
-
-funcs = parser.parse(lexer.lex(source))
-assert isinstance(funcs, list)
 
 def x64_ptr_size(bytes: int) -> str:
     if bytes == 8:
@@ -912,18 +908,70 @@ class X64(DebugPrint):
     PARAM_REGS = [RDI, RSI, RDX, RCX, R8, R9]
     RET_REG = RAX
 
-x64 = X64()
+class Target:
+    def __init__(self, name: str) -> None:
+        self.name = name
 
-with open("test2.s", "w") as f:
-    for func in funcs:
-        assert isinstance(func, Top)
-        func.to_x64(x64).write(f)
-        f.write("\n")
-    f.write("section .note.GNU-stack\n")
+    def run(self, tops: list[Top], output_file: str) -> bool:
+        raise NotImplementedError(self.__class__.__name__, "run")
 
-import subprocess
+class X64Target(Target):
+    def __init__(self) -> None:
+        super().__init__("x64")
 
-if subprocess.run(["nasm", "-f", "elf64", "-o", "test2.o", "test2.s"]).returncode != 0:
+    def run(self, tops: list[Top], output_file: str) -> bool:
+        x64 = X64()
+
+        s_file = get_with_ext(output_file, "s")
+        o_file = get_with_ext(output_file, "o")
+
+        with open(s_file, "w") as f:
+            for top in tops:
+                assert isinstance(top, Top)
+                top.to_x64(x64).write(f)
+                f.write("\n")
+            f.write("section .note.GNU-stack\n")
+
+        if subprocess.run(["nasm", "-f", "elf64", "-o", o_file, s_file]).returncode != 0:
+            return False
+        if subprocess.run(["cc", "-no-pie", "-o", output_file, o_file]).returncode != 0:
+            return False
+
+        return True
+
+TARGETS = [
+    X64Target(),
+]
+
+def get_with_ext(file: str, ext: str | None) -> str:
+    base, _ = os.path.splitext(file)
+    if ext is None:
+        return base
+    return f"{base}.{ext}"
+
+arg_parser = argparse.ArgumentParser(description="TAC compiler")
+arg_parser.add_argument("-o", "--output", type=str, help="Output executable file")
+arg_parser.add_argument("-t", "--target", choices=[t.name for t in TARGETS], default=TARGETS[0].name, help="Target architecture")
+arg_parser.add_argument("input", type=str, help="Input TAC file")
+args = arg_parser.parse_args()
+
+try:
+    with open(args.input, "r") as f:
+        source = f.read()
+except FileNotFoundError:
+    print(f"Error: Input file {args.input} not found")
     exit(1)
-if subprocess.run(["cc", "-no-pie", "-o", "test2", "test2.o"]).returncode != 0:
+
+funcs = parser.parse(lexer.lex(source))
+assert isinstance(funcs, list)
+
+for target in TARGETS:
+    if target.name == args.target:
+        break
+else:
+    print(f"Error: Target {args.target} not found")
+    exit(1)
+
+if not target.run(funcs, args.output or get_with_ext(args.input, None)):
+    print(f"Error: Compilation failed")
     exit(1)

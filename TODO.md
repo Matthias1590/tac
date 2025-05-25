@@ -1,2 +1,4 @@
 - Add optimization passes
+- Add support for floats
 - Add support for other architectures
+- Clean up the code (use modules and refactor some classes)
